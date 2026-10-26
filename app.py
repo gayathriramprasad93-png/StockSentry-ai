@@ -1,6 +1,7 @@
 import warnings
 import sys
-print("Python executable:", sys. executable)
+
+print("Python executable:", sys.executable)
 
 import numpy as np
 import pandas as pd
@@ -49,18 +50,22 @@ st.info(
     "delayed, incomplete, or unavailable."
 )
 
+
 # ---------------- DATA ----------------
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_stock(ticker, period):
-    data = yf.download(
-        ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
+    try:
+        data = yf.download(
+            ticker,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return pd.DataFrame()
 
     if data is None or data.empty:
         return pd.DataFrame()
@@ -115,10 +120,23 @@ FEATURES = [
 ]
 
 
+def build_model():
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("forest", RandomForestClassifier(
+            n_estimators=150,
+            max_depth=6,
+            min_samples_leaf=10,
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=-1,
+        )),
+    ])
+
+
 def train_model(data):
     features = make_features(data)
 
-    # Label: did the price fall over the following 20 sessions?
     future_return = data["Close"].shift(-20) / data["Close"] - 1
 
     dataset = features.copy()
@@ -139,18 +157,7 @@ def train_model(data):
     if y_train.nunique() < 2 or y_test.nunique() < 2:
         return None, None, "Insufficient target-class variation for evaluation."
 
-    model = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("forest", RandomForestClassifier(
-            n_estimators=150,
-            max_depth=6,
-            min_samples_leaf=10,
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        )),
-    ])
-
+    model = build_model()
     model.fit(X_train, y_train)
 
     probabilities = model.predict_proba(X_test)[:, 1]
@@ -158,30 +165,15 @@ def train_model(data):
 
     metrics = {
         "Accuracy": accuracy_score(y_test, predictions),
-        "Precision": precision_score(
-            y_test, predictions, zero_division=0
-        ),
-        "Recall": recall_score(
-            y_test, predictions, zero_division=0
-        ),
+        "Precision": precision_score(y_test, predictions, zero_division=0),
+        "Recall": recall_score(y_test, predictions, zero_division=0),
         "ROC-AUC": roc_auc_score(y_test, probabilities),
         "Test observations": len(y_test),
         "Test start": str(y_test.index.min().date()),
         "Test end": str(y_test.index.max().date()),
     }
 
-    # Refit on all labelled history for the latest estimate.
-    final_model = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("forest", RandomForestClassifier(
-            n_estimators=150,
-            max_depth=6,
-            min_samples_leaf=10,
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        )),
-    ])
+    final_model = build_model()
     final_model.fit(X, y)
 
     latest = features[FEATURES].iloc[[-1]]
@@ -202,10 +194,12 @@ def calculate_metrics(data):
     returns = close.pct_change().dropna()
 
     period_return = (close.iloc[-1] / close.iloc[0] - 1) * 100
+
     volatility = (
         returns.std() * np.sqrt(252) * 100
         if len(returns) > 1 else np.nan
     )
+
     drawdown = (close / close.cummax() - 1) * 100
 
     return {
@@ -253,6 +247,18 @@ def format_inr(value):
     return f"₹{value:,.2f}"
 
 
+def make_ticker(symbol_text, exchange_name):
+    symbol_text = symbol_text.strip().upper()
+
+    if symbol_text.endswith((".NS", ".BO")):
+        return symbol_text
+
+    if exchange_name == "NSE":
+        return symbol_text + ".NS"
+
+    return symbol_text + ".BO"
+
+
 # ---------------- SIDEBAR ----------------
 
 with st.sidebar:
@@ -281,22 +287,16 @@ with st.sidebar:
 
     st.caption("NSE symbols use .NS; BSE codes use .BO.")
 
-if symbol.endswith((".NS", ".BO")):
-    ticker = symbol
-elif exchange == "NSE":
-    ticker = symbol + ".NS"
-elif symbol.isdigit():
-    ticker = symbol + ".BO"
-else:
-    ticker = symbol + ".BO"
-    
+ticker = make_ticker(symbol, exchange)
+
 with st.spinner(f"Downloading historical data for {ticker}..."):
     data = load_stock(ticker, period)
 
 if data.empty or len(data) < 30:
     st.error(
         f"No usable data found for {ticker}. "
-        "Check the symbol or try another stock."
+        "Check the symbol or try another stock. BSE data availability "
+        "depends on the Yahoo Finance data feed."
     )
     st.stop()
 
@@ -307,6 +307,7 @@ latest_date = data.index[-1].date()
 st.caption(
     f"Ticker: {ticker} • Latest downloaded observation: {latest_date}"
 )
+
 
 # ---------------- SUMMARY ----------------
 
@@ -321,9 +322,7 @@ c3.metric(
 )
 c4.metric("Maximum drawdown", f"{metrics['max_drawdown']:.2f}%")
 
-st.caption(
-    "The latest downloaded observation may not be a live market quote."
-)
+st.caption("The latest downloaded observation may not be a live market quote.")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Market Overview",
@@ -331,6 +330,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🧠 ML Lab",
     "⚖️ Compare Stocks",
 ])
+
 
 # ---------------- OVERVIEW ----------------
 
@@ -371,7 +371,6 @@ with tab1:
 
     with left:
         st.subheader("Daily returns")
-
         returns = close.pct_change() * 100
 
         fig = go.Figure(go.Scatter(
@@ -412,11 +411,11 @@ with tab1:
         mime="text/csv",
     )
 
+
 # ---------------- RISK SCANNER ----------------
 
 with tab2:
     st.subheader("Risk and stagnation indicators")
-
     signals = get_risk_signals(data, metrics)
 
     for severity, message in signals:
@@ -428,7 +427,6 @@ with tab2:
             st.info(message)
 
     st.markdown("### Recent price performance")
-
     windows = []
 
     for days in [5, 20, 60, 120, 252]:
@@ -477,6 +475,7 @@ with tab2:
         mime="text/csv",
     )
 
+
 # ---------------- MACHINE LEARNING ----------------
 
 with tab3:
@@ -500,7 +499,6 @@ with tab3:
 
         if error:
             st.error(error)
-
         else:
             a, b, c = st.columns(3)
 
@@ -508,12 +506,10 @@ with tab3:
                 "Estimated downside probability",
                 f"{result['probability'] * 100:.1f}%",
             )
-
             b.metric("Test accuracy", f"{scores['Accuracy'] * 100:.1f}%")
             c.metric("Test ROC-AUC", f"{scores['ROC-AUC']:.3f}")
 
             d, e, f = st.columns(3)
-
             d.metric("Test precision", f"{scores['Precision']:.3f}")
             e.metric("Test recall", f"{scores['Recall']:.3f}")
             f.metric("Test observations", scores["Test observations"])
@@ -566,15 +562,16 @@ with tab3:
                 mime="text/csv",
             )
 
+
 # ---------------- STOCK COMPARISON ----------------
 
 with tab4:
     st.subheader("Compare Indian stocks")
 
     symbols = list(dict.fromkeys([
-        s.strip().upper()
-        for s in compare_symbols.split(",")
-        if s.strip()
+        item.strip().upper()
+        for item in compare_symbols.split(",")
+        if item.strip()
     ]))
 
     comparison_rows = []
@@ -582,22 +579,20 @@ with tab4:
 
     with st.spinner("Loading comparison data..."):
         for item in symbols[:6]:
-            comp_ticker = (
-                item if item.endswith((".NS", ".BO"))
-                else item + suffix
-            )
-
+            comp_ticker = make_ticker(item, exchange)
             comp = load_stock(comp_ticker, period)
 
             if comp.empty or len(comp) < 30:
                 continue
 
             comp_close = comp["Close"]
+
             comp_return = (
                 comp_close.iloc[-1] / comp_close.iloc[0] - 1
             ) * 100
 
             daily = comp_close.pct_change().dropna()
+
             comp_vol = (
                 daily.std() * np.sqrt(252) * 100
                 if len(daily) > 1 else np.nan
@@ -611,7 +606,10 @@ with tab4:
                 "Ticker": comp_ticker,
                 "Latest price": round(float(comp_close.iloc[-1]), 2),
                 "Period return (%)": round(float(comp_return), 2),
-                "Annualized volatility (%)": round(float(comp_vol), 2),
+                "Annualized volatility (%)": (
+                    round(float(comp_vol), 2)
+                    if pd.notna(comp_vol) else np.nan
+                ),
                 "Maximum drawdown (%)": round(float(comp_drawdown), 2),
             })
 
@@ -657,7 +655,6 @@ with tab4:
             file_name="stocksentry_comparison.csv",
             mime="text/csv",
         )
-
     else:
         st.info(
             "No comparison data was available. Try NSE symbols such as "
