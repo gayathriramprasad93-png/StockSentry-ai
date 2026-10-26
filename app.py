@@ -1,4 +1,6 @@
 import warnings
+import sys
+print("Python executable:", sys. executable)
 
 import numpy as np
 import pandas as pd
