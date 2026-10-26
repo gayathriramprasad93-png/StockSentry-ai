@@ -50,6 +50,51 @@ st.info(
     "delayed, incomplete, or unavailable."
 )
 
+# ---------------- STOCK UNIVERSE ----------------
+
+POPULAR_STOCKS = {
+    "Reliance Industries": "RELIANCE",
+    "HDFC Bank": "HDFCBANK",
+    "ICICI Bank": "ICICIBANK",
+    "State Bank of India": "SBIN",
+    "Axis Bank": "AXISBANK",
+    "Kotak Mahindra Bank": "KOTAKBANK",
+    "Infosys": "INFY",
+    "Tata Consultancy Services": "TCS",
+    "Wipro": "WIPRO",
+    "HCL Technologies": "HCLTECH",
+    "Bharti Airtel": "BHARTIARTL",
+    "Larsen & Toubro": "LT",
+    "ITC": "ITC",
+    "Mahindra & Mahindra": "M&M",
+    "Maruti Suzuki": "MARUTI",
+    "Tata Steel": "TATASTEEL",
+    "JSW Steel": "JSWSTEEL",
+    "Sun Pharmaceutical": "SUNPHARMA",
+    "Tata Consumer Products": "TATACONSUM",
+    "Titan Company": "TITAN",
+    "Asian Paints": "ASIANPAINT",
+    "Bajaj Finance": "BAJFINANCE",
+    "Power Grid": "POWERGRID",
+    "NTPC": "NTPC",
+    "Adani Ports": "ADANIPORTS",
+    "UltraTech Cement": "ULTRACEMCO",
+    "Eicher Motors": "EICHERMOT",
+    "Hindustan Unilever": "HINDUNILVR",
+    "Coal India": "COALINDIA",
+    "Tata Motors Passenger Vehicles": "TMPV",
+}
+
+
+def make_ticker(symbol_text, exchange_name):
+    symbol_text = str(symbol_text).strip().upper()
+
+    if symbol_text.endswith((".NS", ".BO")):
+        return symbol_text
+
+    suffix = ".NS" if exchange_name == "NSE" else ".BO"
+    return symbol_text + suffix
+
 
 # ---------------- DATA ----------------
 
@@ -84,7 +129,80 @@ def load_stock(ticker, period):
         data[col] = pd.to_numeric(data[col], errors="coerce")
 
     data = data.dropna(subset=["Close"])
-    return data[~data.index.duplicated(keep="last")].sort_index()
+
+    return data[
+        ~data.index.duplicated(keep="last")
+    ].sort_index()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_annual_financials(ticker):
+    """Get annual revenue and net-income growth when available."""
+    try:
+        statement = yf.Ticker(ticker).income_stmt
+
+        if statement is None or statement.empty:
+            return None
+
+        revenue_row = next(
+            (
+                row for row in [
+                    "Total Revenue",
+                    "Operating Revenue",
+                ]
+                if row in statement.index
+            ),
+            None,
+        )
+
+        income_row = next(
+            (
+                row for row in [
+                    "Net Income",
+                    "Net Income Common Stockholders",
+                ]
+                if row in statement.index
+            ),
+            None,
+        )
+
+        if revenue_row is None and income_row is None:
+            return None
+
+        result = {}
+
+        for label, row in [
+            ("Revenue", revenue_row),
+            ("Net income", income_row),
+        ]:
+            if row is None:
+                result[label] = np.nan
+                continue
+
+            values = pd.to_numeric(
+                statement.loc[row],
+                errors="coerce",
+            ).dropna()
+
+            values = values.sort_index()
+
+            if len(values) >= 2:
+                prior = float(values.iloc[-2])
+                latest = float(values.iloc[-1])
+
+                if prior != 0:
+                    result[label] = (
+                        (latest / abs(prior)) - 1
+                    ) * 100
+                else:
+                    result[label] = np.nan
+            else:
+                result[label] = np.nan
+
+        return result
+
+    except Exception:
+        return None
 
 
 def make_features(data):
@@ -95,13 +213,34 @@ def make_features(data):
     df["return_1d"] = close.pct_change()
     df["return_5d"] = close.pct_change(5)
     df["return_20d"] = close.pct_change(20)
-    df["volatility_20d"] = df["return_1d"].rolling(20).std()
-    df["volatility_60d"] = df["return_1d"].rolling(60).std()
-    df["ma_ratio_20"] = close / close.rolling(20).mean() - 1
-    df["ma_ratio_50"] = close / close.rolling(50).mean() - 1
-    df["ma_ratio_200"] = close / close.rolling(200).mean() - 1
-    df["drawdown_60d"] = close / close.rolling(60).max() - 1
-    df["volume_ratio_20d"] = volume / volume.rolling(20).mean()
+
+    df["volatility_20d"] = (
+        df["return_1d"].rolling(20).std()
+    )
+
+    df["volatility_60d"] = (
+        df["return_1d"].rolling(60).std()
+    )
+
+    df["ma_ratio_20"] = (
+        close / close.rolling(20).mean() - 1
+    )
+
+    df["ma_ratio_50"] = (
+        close / close.rolling(50).mean() - 1
+    )
+
+    df["ma_ratio_200"] = (
+        close / close.rolling(200).mean() - 1
+    )
+
+    df["drawdown_60d"] = (
+        close / close.rolling(60).max() - 1
+    )
+
+    df["volume_ratio_20d"] = (
+        volume / volume.rolling(20).mean()
+    )
 
     return df.replace([np.inf, -np.inf], np.nan)
 
@@ -123,39 +262,61 @@ FEATURES = [
 def build_model():
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
-        ("forest", RandomForestClassifier(
-            n_estimators=150,
-            max_depth=6,
-            min_samples_leaf=10,
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1,
-        )),
+        (
+            "forest",
+            RandomForestClassifier(
+                n_estimators=150,
+                max_depth=6,
+                min_samples_leaf=10,
+                class_weight="balanced",
+                random_state=42,
+                n_jobs=-1,
+            ),
+        ),
     ])
 
 
 def train_model(data):
     features = make_features(data)
 
-    future_return = data["Close"].shift(-20) / data["Close"] - 1
+    future_return = (
+        data["Close"].shift(-20) / data["Close"] - 1
+    )
 
     dataset = features.copy()
-    dataset["target"] = (future_return < 0).astype(float)
-    dataset.loc[future_return.isna(), "target"] = np.nan
+    dataset["target"] = (
+        future_return < 0
+    ).astype(float)
+
+    dataset.loc[
+        future_return.isna(), "target"
+    ] = np.nan
+
     dataset = dataset.dropna(subset=["target"])
 
     if len(dataset) < 250:
-        return None, None, "Not enough historical data. Try a longer period."
+        return (
+            None,
+            None,
+            "Not enough historical data. Try a longer period.",
+        )
 
     X = dataset[FEATURES]
     y = dataset["target"].astype(int)
 
     split = int(len(dataset) * 0.8)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    X_train = X.iloc[:split]
+    X_test = X.iloc[split:]
+    y_train = y.iloc[:split]
+    y_test = y.iloc[split:]
 
     if y_train.nunique() < 2 or y_test.nunique() < 2:
-        return None, None, "Insufficient target-class variation for evaluation."
+        return (
+            None,
+            None,
+            "Insufficient target-class variation for evaluation.",
+        )
 
     model = build_model()
     model.fit(X_train, y_train)
@@ -165,8 +326,12 @@ def train_model(data):
 
     metrics = {
         "Accuracy": accuracy_score(y_test, predictions),
-        "Precision": precision_score(y_test, predictions, zero_division=0),
-        "Recall": recall_score(y_test, predictions, zero_division=0),
+        "Precision": precision_score(
+            y_test, predictions, zero_division=0
+        ),
+        "Recall": recall_score(
+            y_test, predictions, zero_division=0
+        ),
         "ROC-AUC": roc_auc_score(y_test, probabilities),
         "Test observations": len(y_test),
         "Test start": str(y_test.index.min().date()),
@@ -193,14 +358,19 @@ def calculate_metrics(data):
     close = data["Close"]
     returns = close.pct_change().dropna()
 
-    period_return = (close.iloc[-1] / close.iloc[0] - 1) * 100
+    period_return = (
+        close.iloc[-1] / close.iloc[0] - 1
+    ) * 100
 
     volatility = (
         returns.std() * np.sqrt(252) * 100
-        if len(returns) > 1 else np.nan
+        if len(returns) > 1
+        else np.nan
     )
 
-    drawdown = (close / close.cummax() - 1) * 100
+    drawdown = (
+        close / close.cummax() - 1
+    ) * 100
 
     return {
         "price": float(close.iloc[-1]),
@@ -220,24 +390,45 @@ def get_risk_signals(data, metrics):
     r60 = close.pct_change(60).iloc[-1]
 
     if pd.notna(r20) and r20 < -0.10:
-        signals.append(("High", "Price declined over 10% in 20 sessions."))
+        signals.append((
+            "High",
+            "Price declined over 10% in 20 sessions.",
+        ))
 
     if pd.notna(r60) and r60 < -0.15:
-        signals.append(("High", "Price declined over 15% in 60 sessions."))
+        signals.append((
+            "High",
+            "Price declined over 15% in 60 sessions.",
+        ))
 
-    if pd.notna(metrics["ma200"]) and metrics["price"] < metrics["ma200"]:
-        signals.append(("Moderate", "Price is below its 200-day average."))
+    if (
+        pd.notna(metrics["ma200"])
+        and metrics["price"] < metrics["ma200"]
+    ):
+        signals.append((
+            "Moderate",
+            "Price is below its 200-day average.",
+        ))
 
-    if pd.notna(metrics["volatility"]) and metrics["volatility"] > 45:
-        signals.append(("High", "Annualized historical volatility exceeds 45%."))
+    if (
+        pd.notna(metrics["volatility"])
+        and metrics["volatility"] > 45
+    ):
+        signals.append((
+            "High",
+            "Annualized historical volatility exceeds 45%.",
+        ))
 
     if metrics["max_drawdown"] < -30:
-        signals.append(("High", "Historical maximum drawdown exceeds 30%."))
+        signals.append((
+            "High",
+            "Historical maximum drawdown exceeds 30%.",
+        ))
 
     if not signals:
         signals.append((
             "No configured warning triggered",
-            "This does not mean the stock is safe or a good investment."
+            "This does not mean the stock is safe or a good investment.",
         ))
 
     return signals
@@ -247,30 +438,24 @@ def format_inr(value):
     return f"₹{value:,.2f}"
 
 
-def make_ticker(symbol_text, exchange_name):
-    symbol_text = symbol_text.strip().upper()
-
-    if symbol_text.endswith((".NS", ".BO")):
-        return symbol_text
-
-    if exchange_name == "NSE":
-        return symbol_text + ".NS"
-
-    return symbol_text + ".BO"
-
-
 # ---------------- SIDEBAR ----------------
 
 with st.sidebar:
     st.header("Analysis settings")
 
-    exchange = st.selectbox("Exchange", ["NSE", "BSE"])
-    default_symbol = "RELIANCE" if exchange == "NSE" else "500325"
+    exchange = st.selectbox(
+        "Exchange",
+        ["NSE", "BSE"],
+    )
+
+    default_symbol = (
+        "RELIANCE" if exchange == "NSE" else "500325"
+    )
 
     symbol = st.text_input(
         "Stock symbol",
         value=default_symbol,
-        help="Examples: RELIANCE, TCS, INFY, HDFCBANK",
+        help="Examples: RELIANCE, HDFCBANK, TCS, INFY",
     ).strip().upper()
 
     period = st.selectbox(
@@ -282,10 +467,10 @@ with st.sidebar:
     compare_symbols = st.text_input(
         "Compare stocks",
         value="TCS, INFY",
-        help="Enter comma-separated symbols.",
     )
 
     st.caption("NSE symbols use .NS; BSE codes use .BO.")
+
 
 ticker = make_ticker(symbol, exchange)
 
@@ -295,8 +480,8 @@ with st.spinner(f"Downloading historical data for {ticker}..."):
 if data.empty or len(data) < 30:
     st.error(
         f"No usable data found for {ticker}. "
-        "Check the symbol or try another stock. BSE data availability "
-        "depends on the Yahoo Finance data feed."
+        "Check the symbol or try another stock. "
+        "BSE data availability depends on the Yahoo Finance data feed."
     )
     st.stop()
 
@@ -313,22 +498,38 @@ st.caption(
 
 c1, c2, c3, c4 = st.columns(4)
 
-c1.metric("Latest adjusted price", format_inr(metrics["price"]))
-c2.metric("Period return", f"{metrics['return']:+.2f}%")
+c1.metric(
+    "Latest adjusted price",
+    format_inr(metrics["price"]),
+)
+
+c2.metric(
+    "Period return",
+    f"{metrics['return']:+.2f}%",
+)
+
 c3.metric(
     "Annualized volatility",
     f"{metrics['volatility']:.2f}%"
-    if pd.notna(metrics["volatility"]) else "N/A",
+    if pd.notna(metrics["volatility"])
+    else "N/A",
 )
-c4.metric("Maximum drawdown", f"{metrics['max_drawdown']:.2f}%")
 
-st.caption("The latest downloaded observation may not be a live market quote.")
+c4.metric(
+    "Maximum drawdown",
+    f"{metrics['max_drawdown']:.2f}%",
+)
 
-tab1, tab2, tab3, tab4 = st.tabs([
+st.caption(
+    "The latest downloaded observation may not be a live market quote."
+)
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Market Overview",
     "🛡️ Risk Scanner",
     "🧠 ML Lab",
     "⚖️ Compare Stocks",
+    "🚀 Growth Scanner",
 ])
 
 
@@ -454,8 +655,14 @@ with tab2:
         {"Indicator": "Last observation", "Value": str(latest_date)},
         {"Indicator": "Latest adjusted price", "Value": metrics["price"]},
         {"Indicator": "Period return (%)", "Value": metrics["return"]},
-        {"Indicator": "Annualized volatility (%)", "Value": metrics["volatility"]},
-        {"Indicator": "Maximum drawdown (%)", "Value": metrics["max_drawdown"]},
+        {
+            "Indicator": "Annualized volatility (%)",
+            "Value": metrics["volatility"],
+        },
+        {
+            "Indicator": "Maximum drawdown (%)",
+            "Value": metrics["max_drawdown"],
+        },
         {"Indicator": "50-day average", "Value": metrics["ma50"]},
         {"Indicator": "200-day average", "Value": metrics["ma200"]},
     ]
@@ -466,11 +673,9 @@ with tab2:
             "Value": f"{severity}: {message}",
         })
 
-    report = pd.DataFrame(report_rows)
-
     st.download_button(
         "Download investigation report (CSV)",
-        report.to_csv(index=False).encode("utf-8"),
+        pd.DataFrame(report_rows).to_csv(index=False).encode("utf-8"),
         file_name=f"{ticker.replace('.', '_')}_risk_report.csv",
         mime="text/csv",
     )
@@ -506,10 +711,19 @@ with tab3:
                 "Estimated downside probability",
                 f"{result['probability'] * 100:.1f}%",
             )
-            b.metric("Test accuracy", f"{scores['Accuracy'] * 100:.1f}%")
-            c.metric("Test ROC-AUC", f"{scores['ROC-AUC']:.3f}")
+
+            b.metric(
+                "Test accuracy",
+                f"{scores['Accuracy'] * 100:.1f}%",
+            )
+
+            c.metric(
+                "Test ROC-AUC",
+                f"{scores['ROC-AUC']:.3f}",
+            )
 
             d, e, f = st.columns(3)
+
             d.metric("Test precision", f"{scores['Precision']:.3f}")
             e.metric("Test recall", f"{scores['Recall']:.3f}")
             f.metric("Test observations", scores["Test observations"])
@@ -551,16 +765,18 @@ with tab3:
                 **scores,
             }
 
-    if "ml_report" in st.session_state:
-        ml_report = st.session_state["ml_report"]
-
-        if ml_report["Ticker"] == ticker:
-            st.download_button(
-                "Download ML evaluation (CSV)",
-                pd.DataFrame([ml_report]).to_csv(index=False).encode("utf-8"),
-                file_name=f"{ticker.replace('.', '_')}_ml_report.csv",
-                mime="text/csv",
-            )
+    if (
+        "ml_report" in st.session_state
+        and st.session_state["ml_report"]["Ticker"] == ticker
+    ):
+        st.download_button(
+            "Download ML evaluation (CSV)",
+            pd.DataFrame([
+                st.session_state["ml_report"]
+            ]).to_csv(index=False).encode("utf-8"),
+            file_name=f"{ticker.replace('.', '_')}_ml_report.csv",
+            mime="text/csv",
+        )
 
 
 # ---------------- STOCK COMPARISON ----------------
@@ -595,7 +811,8 @@ with tab4:
 
             comp_vol = (
                 daily.std() * np.sqrt(252) * 100
-                if len(daily) > 1 else np.nan
+                if len(daily) > 1
+                else np.nan
             )
 
             comp_drawdown = (
@@ -608,12 +825,15 @@ with tab4:
                 "Period return (%)": round(float(comp_return), 2),
                 "Annualized volatility (%)": (
                     round(float(comp_vol), 2)
-                    if pd.notna(comp_vol) else np.nan
+                    if pd.notna(comp_vol)
+                    else np.nan
                 ),
                 "Maximum drawdown (%)": round(float(comp_drawdown), 2),
             })
 
-            normalized = comp_close / comp_close.iloc[0] * 100
+            normalized = (
+                comp_close / comp_close.iloc[0] * 100
+            )
 
             comparison_chart.add_trace(go.Scatter(
                 x=normalized.index,
@@ -638,7 +858,10 @@ with tab4:
         hovermode="x unified",
     )
 
-    st.plotly_chart(comparison_chart, use_container_width=True)
+    st.plotly_chart(
+        comparison_chart,
+        use_container_width=True,
+    )
 
     if comparison_rows:
         comparison_df = pd.DataFrame(comparison_rows)
@@ -660,6 +883,352 @@ with tab4:
             "No comparison data was available. Try NSE symbols such as "
             "TCS, INFY or RELIANCE."
         )
+
+
+# ---------------- GROWTH SCANNER ----------------
+
+with tab5:
+    st.subheader("🚀 Growth Scanner")
+
+    st.write(
+        "Screen popular stocks and your own NSE/BSE symbols for "
+        "historical price momentum and available annual revenue/net-income "
+        "growth. This is a research tool, not a buy/sell recommendation."
+    )
+
+    st.caption(
+        "Enter Yahoo Finance ticker symbols, not company names. "
+        "NSE symbols usually use .NS; BSE symbols usually use .BO. "
+        "Data coverage is not guaranteed for every listing."
+    )
+
+    scan_exchange = st.selectbox(
+        "Exchange for symbols without a suffix",
+        ["NSE", "BSE"],
+        key="growth_exchange",
+    )
+
+    stock_names = list(POPULAR_STOCKS.keys())
+
+    selected_names = st.multiselect(
+        "Choose from popular companies (optional)",
+        options=stock_names,
+        default=[
+            "Reliance Industries",
+            "HDFC Bank",
+            "ICICI Bank",
+            "State Bank of India",
+            "Infosys",
+            "Tata Consultancy Services",
+            "Bharti Airtel",
+            "Larsen & Toubro",
+            "Bajaj Finance",
+            "NTPC",
+        ],
+    )
+
+    custom_symbols = st.text_area(
+        "Add any other symbols (comma-separated)",
+        placeholder=(
+            "e.g. HDFCBANK, TRENT, BEL, "
+            "HDFCBANK.NS, 500180.BO"
+        ),
+        help=(
+            "Enter symbols you know. Symbols that the data source "
+            "cannot resolve will be reported as unavailable."
+        ),
+    )
+
+    min_price_return = st.slider(
+        "Minimum 60-session price return (%)",
+        min_value=-30,
+        max_value=30,
+        value=0,
+        step=5,
+    )
+
+    max_scan_count = 50
+
+    run_scan = st.button(
+        "Scan for growing stocks",
+        type="primary",
+    )
+
+    if run_scan:
+        scan_items = []
+
+        for company_name in selected_names:
+            scan_items.append((
+                company_name,
+                POPULAR_STOCKS[company_name],
+            ))
+
+        for raw_symbol in (
+            custom_symbols.replace("\n", ",").split(",")
+        ):
+            raw_symbol = raw_symbol.strip().upper()
+
+            if raw_symbol:
+                scan_items.append((
+                    raw_symbol,
+                    raw_symbol,
+                ))
+
+        deduplicated = []
+        seen_tickers = set()
+
+        for label, raw_symbol in scan_items:
+            scan_ticker = make_ticker(
+                raw_symbol,
+                scan_exchange,
+            )
+
+            if scan_ticker not in seen_tickers:
+                seen_tickers.add(scan_ticker)
+                deduplicated.append((
+                    label,
+                    scan_ticker,
+                ))
+
+        deduplicated = deduplicated[:max_scan_count]
+
+        if not deduplicated:
+            st.warning(
+                "Choose at least one company or enter one or more symbols."
+            )
+        else:
+            if len(scan_items) > max_scan_count:
+                st.warning(
+                    "To reduce data-source throttling, this run is limited "
+                    f"to the first {max_scan_count} unique symbols."
+                )
+
+            scan_rows = []
+            progress = st.progress(
+                0,
+                text="Starting scan...",
+            )
+
+            for idx, (label, scan_ticker) in enumerate(deduplicated):
+                history = load_stock(scan_ticker, "1y")
+
+                row = {
+                    "Company / input": (
+                        label
+                        if label in POPULAR_STOCKS
+                        else scan_ticker
+                    ),
+                    "Ticker": scan_ticker,
+                    "Latest price": np.nan,
+                    "20-session return (%)": np.nan,
+                    "60-session return (%)": np.nan,
+                    "1-year return (%)": np.nan,
+                    "Revenue growth (%)": np.nan,
+                    "Net income growth (%)": np.nan,
+                    "Price momentum": "Unavailable",
+                    "Business growth": "Unavailable",
+                    "Screen result": "No usable price data",
+                }
+
+                if not history.empty and len(history) >= 30:
+                    prices = history["Close"]
+
+                    row["Latest price"] = round(
+                        float(prices.iloc[-1]), 2
+                    )
+
+                    if len(prices) > 20:
+                        row["20-session return (%)"] = round(
+                            float(
+                                (
+                                    prices.iloc[-1]
+                                    / prices.iloc[-21] - 1
+                                ) * 100
+                            ),
+                            2,
+                        )
+
+                    if len(prices) > 60:
+                        row["60-session return (%)"] = round(
+                            float(
+                                (
+                                    prices.iloc[-1]
+                                    / prices.iloc[-61] - 1
+                                ) * 100
+                            ),
+                            2,
+                        )
+
+                    if len(prices) > 200:
+                        row["1-year return (%)"] = round(
+                            float(
+                                (
+                                    prices.iloc[-1]
+                                    / prices.iloc[0] - 1
+                                ) * 100
+                            ),
+                            2,
+                        )
+
+                    r60 = row["60-session return (%)"]
+
+                    if pd.notna(r60) and r60 > 0:
+                        row["Price momentum"] = "Positive"
+                    elif pd.notna(r60):
+                        row["Price momentum"] = "Not positive"
+
+                financials = load_annual_financials(
+                    scan_ticker
+                )
+
+                if financials:
+                    rev_value = financials.get(
+                        "Revenue", np.nan
+                    )
+                    income_value = financials.get(
+                        "Net income", np.nan
+                    )
+
+                    if pd.notna(rev_value):
+                        row["Revenue growth (%)"] = round(
+                            rev_value, 2
+                        )
+
+                    if pd.notna(income_value):
+                        row["Net income growth (%)"] = round(
+                            income_value, 2
+                        )
+
+                    rev = row["Revenue growth (%)"]
+                    ni = row["Net income growth (%)"]
+
+                    if pd.notna(rev) and pd.notna(ni):
+                        if rev > 0 and ni > 0:
+                            row["Business growth"] = (
+                                "Revenue + profit growing"
+                            )
+                        else:
+                            row["Business growth"] = (
+                                "Mixed / not growing"
+                            )
+                    elif pd.notna(rev):
+                        row["Business growth"] = (
+                            "Revenue only available"
+                        )
+                    elif pd.notna(ni):
+                        row["Business growth"] = (
+                            "Profit only available"
+                        )
+
+                r60 = row["60-session return (%)"]
+                rev = row["Revenue growth (%)"]
+                ni = row["Net income growth (%)"]
+
+                if pd.isna(r60):
+                    row["Screen result"] = (
+                        "Insufficient price history"
+                    )
+                elif r60 < min_price_return:
+                    row["Screen result"] = (
+                        "Below momentum threshold"
+                    )
+                elif (
+                    pd.notna(rev)
+                    and pd.notna(ni)
+                    and rev > 0
+                    and ni > 0
+                ):
+                    row["Screen result"] = (
+                        "Momentum + revenue/profit growth"
+                    )
+                elif r60 > 0:
+                    row["Screen result"] = (
+                        "Positive momentum; fundamentals incomplete/mixed"
+                    )
+                else:
+                    row["Screen result"] = (
+                        "Passed price threshold only"
+                    )
+
+                scan_rows.append(row)
+
+                progress.progress(
+                    (idx + 1) / len(deduplicated),
+                    text=(
+                        f"Scanned {idx + 1} of "
+                        f"{len(deduplicated)} symbols..."
+                    ),
+                )
+
+            progress.empty()
+
+            results = pd.DataFrame(scan_rows)
+
+            if not results.empty:
+                results = results.sort_values(
+                    by=["60-session return (%)"],
+                    ascending=False,
+                    na_position="last",
+                )
+
+                st.subheader("Screening results")
+
+                st.dataframe(
+                    results,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                st.download_button(
+                    "Download Growth Scanner results (CSV)",
+                    results.to_csv(index=False).encode("utf-8"),
+                    file_name="stocksentry_growth_scanner.csv",
+                    mime="text/csv",
+                )
+
+                st.markdown(
+                    "### Strongest 60-session momentum in this scan"
+                )
+
+                chart_data = results.dropna(
+                    subset=["60-session return (%)"]
+                ).sort_values(
+                    "60-session return (%)",
+                    ascending=True,
+                )
+
+                if not chart_data.empty:
+                    fig = go.Figure(go.Bar(
+                        x=chart_data["60-session return (%)"],
+                        y=chart_data["Ticker"],
+                        orientation="h",
+                    ))
+
+                    fig.update_layout(
+                        template="plotly_dark",
+                        title="60-session price return (%)",
+                        height=max(
+                            350,
+                            28 * len(chart_data),
+                        ),
+                        xaxis_title="Return (%)",
+                    )
+
+                    st.plotly_chart(
+                        fig,
+                        use_container_width=True,
+                    )
+
+                st.warning(
+                    "This scanner checks only the symbols you selected "
+                    "or entered; it does not automatically cover every "
+                    "listed stock. Yahoo Finance coverage and financial "
+                    "statement availability vary. Positive historical "
+                    "returns and growth do not guarantee future performance. "
+                    "Verify company fundamentals against official filings "
+                    "before making investment decisions."
+                )
+
 
 st.divider()
 
