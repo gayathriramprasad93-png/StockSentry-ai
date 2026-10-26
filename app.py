@@ -281,12 +281,15 @@ with st.sidebar:
 
     st.caption("NSE symbols use .NS; BSE codes use .BO.")
 
-suffix = ".NS" if exchange == "NSE" else ".BO"
-ticker = (
-    symbol if symbol.endswith((".NS", ".BO"))
-    else symbol + suffix
-)
-
+if symbol.endswith((".NS", ".BO")):
+    ticker = symbol
+elif exchange == "NSE":
+    ticker = symbol + ".NS"
+elif symbol.isdigit():
+    ticker = symbol + ".BO"
+else:
+    ticker = symbol + ".BO"
+    
 with st.spinner(f"Downloading historical data for {ticker}..."):
     data = load_stock(ticker, period)
 
